@@ -1,2 +1,0 @@
-clearing all screen
-not showing like top and htop

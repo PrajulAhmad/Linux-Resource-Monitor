@@ -1,19 +1,19 @@
-CC = gcc
-CFLAGS = -Wall -Wextra
+CC=gcc
+CFLAGS=-Wall -Wextra -O2
+
+SRC = main.c analyzer.c reader.c logger.c
+OBJ = $(SRC:.c=.o)
 TARGET = monitor
-OBJS = main.o reader.o analyzer.o logger.o
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+all: $(TARGET)
 
-main.o: main.c monitor.h
-	$(CC) $(CFLAGS) -c main.c
-reader.o: reader.c monitor.h
-	$(CC) $(CFLAGS) -c reader.c
-analyzer.o: analyzer.c monitor.h
-	$(CC) $(CFLAGS) -c analyzer.c
-logger.o: logger.c monitor.h
-	$(CC) $(CFLAGS) -c logger.c
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJ)
+
+%.o: %.c monitor.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJ) $(TARGET)
+
+.PHONY: all clean

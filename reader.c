@@ -1,79 +1,90 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "monitor.h"
 
-int is_numeric(const char *str) {
-    for (int i = 0; str[i]; i++) {
-        if (!isdigit(str[i])) return 0;
-    }
-    return 1;
-}
-
-void read_mem_stats(MemStats *stats) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return;
-    char line[256];
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line, "MemTotal: %ld kB", &stats->total_ram);
-        else if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line, "MemAvailable: %ld kB", &stats->available_ram);
-    }
-    fclose(fp);
-}
-
-void read_cpu_stats(CpuStats *stats) {
+void get_system_cpu(unsigned long long *total, unsigned long long *idle_val) {
     FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return;
-    char line[256];
-    if (fgets(line, sizeof(line), fp)) {
-        // FIX: Using "cpu %llu" (one space) matches ANY amount of whitespace.
-        // This prevents failures if the kernel uses 1 space vs 2 spaces.
-        sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-               &stats->curr.user, &stats->curr.nice, &stats->curr.system,
-               &stats->curr.idle, &stats->curr.iowait, &stats->curr.irq,
-               &stats->curr.softirq, &stats->curr.steal);
-    }
+    if (!fp) { *total = 0; *idle_val = 0; return; }
+
+    char line[512];
+    if (!fgets(line, sizeof(line), fp)) { fclose(fp); *total = 0; *idle_val = 0; return; }
     fclose(fp);
+
+    unsigned long long user=0,nice=0,system=0,idle=0,iowait=0,irq=0,softirq=0,steal=0;
+    sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+           &user,&nice,&system,&idle,&iowait,&irq,&softirq,&steal);
+
+    *idle_val = idle + iowait;
+    *total = user + nice + system + idle + iowait + irq + softirq + steal;
 }
 
-void read_processes(ProcessInfo *procs, int max_storage, int *count) {
-    DIR *dir = opendir("/proc");
-    struct dirent *entry;
-    if (!dir) return;
+void get_system_mem(GlobalStats *stats) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) { stats->total_mem_kb=0; stats->used_mem_kb=0; stats->mem_percent=0; return; }
 
-    *count = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        if (*count >= max_storage) break;
-        if (!is_numeric(entry->d_name)) continue;
+    char line[256];
+    unsigned long total=0,avail=0;
 
-        char path[512];
-        snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
-        
-        FILE *fp = fopen(path, "r");
-        if (fp) {
-            int pid;
-            char comm[256];
-            char state;
-            if (fscanf(fp, "%d %s %c", &pid, comm, &state) == 3) {
-                int dummy;
-                for(int i = 0; i < 20; i++) fscanf(fp, "%d", &dummy);
-                long rss_pages;
-                long rss_kb = 0;
-                if(fscanf(fp, "%ld", &rss_pages) == 1) rss_kb = rss_pages * 4;
-
-                if (rss_kb > 0) {
-                    procs[*count].pid = pid;
-                    if (comm[0] == '(') {
-                        size_t len = strlen(comm);
-                        comm[len-1] = '\0';
-                        strcpy(procs[*count].name, comm + 1);
-                    } else {
-                        strcpy(procs[*count].name, comm);
-                    }
-                    procs[*count].state = state;
-                    procs[*count].rss = rss_kb;
-                    (*count)++;
-                }
-            }
-            fclose(fp);
-        }
+    while (fgets(line, sizeof(line), fp)) {
+        sscanf(line, "MemTotal: %lu kB", &total);
+        sscanf(line, "MemAvailable: %lu kB", &avail);
     }
-    closedir(dir);
+    fclose(fp);
+
+    stats->total_mem_kb = total;
+    stats->used_mem_kb  = (total > avail) ? (total - avail) : 0;
+    stats->mem_percent  = (total > 0) ? ((double)stats->used_mem_kb / total * 100.0) : 0.0;
+}
+
+int get_proc_details(int pid, ProcessInfo *p) {
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+
+    char buf[2048];
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return 0; }
+    fclose(fp);
+
+    char *l = strchr(buf, '(');
+    char *r = strrchr(buf, ')');
+    if (!l || !r || r < l) return 0;
+
+    size_t len = r - l - 1;
+    if (len > 255) len = 255;
+    memcpy(p->name, l+1, len);
+    p->name[len] = '\0';
+
+    char *rest = r + 2;
+    char state = 'R';
+    unsigned long utime=0, stime=0;
+
+    // FIXED SCAN LINE (NO WARNINGS)
+    sscanf(rest,
+        "%c %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu",
+        &state, &utime, &stime);
+
+    p->pid = pid;
+    p->state = state;
+    p->old_utime = utime;
+    p->old_stime = stime;
+
+    // memory
+    snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+    fp = fopen(path, "r");
+    if (fp) {
+        unsigned long size,res;
+        if (fscanf(fp, "%lu %lu", &size, &res) == 2) {
+            long pg = sysconf(_SC_PAGESIZE);
+            if (pg <= 0) pg = 4096;
+            p->memory_kb = (res * pg) / 1024;
+        }
+        fclose(fp);
+    }
+
+    p->cpu_usage = 0.0;
+    p->active = 0;
+    return 1;
 }

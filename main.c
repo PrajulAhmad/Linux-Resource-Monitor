@@ -1,92 +1,147 @@
 #include <stdio.h>
-#include <signal.h> 
+#include <stdlib.h>
+#include <unistd.h>
+#include <termios.h>
+#include <string.h>
+#include <fcntl.h>
+#include <signal.h>
 #include "monitor.h"
 
-volatile sig_atomic_t keep_running = 1;
+#define REFRESH_MS 2000
+#define POLL_MS 100
 
-void handle_sigint(int sig) {
-    (void)sig; 
-    keep_running = 0; 
-}
+static struct termios orig_term;
+static volatile sig_atomic_t sigint_flag = 0;
 
-// Helper: Enables "Alternate Screen" (Like vim/htop)
-// This PREVENTS scrolling history
-void set_alt_screen(int enable) {
-    if (enable) {
-        printf("\033[?1049h"); // Save terminal and switch to buffer
-        printf("\033[H");      // Move Home
-    } else {
-        printf("\033[?1049l"); // Restore original terminal
-    }
+void restore_terminal() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
+    printf("\033[?25h\033[?1049l");
     fflush(stdout);
 }
 
-void print_stats(CpuStats *cpu, MemStats *mem, ProcessInfo *procs, int proc_count) {
-    // Move to top-left (Do not use clear)
-    printf("\033[H"); 
-    
-    printf("=== Linux Resource Monitor ===\n");
-    printf("CPU Usage:    %.2f %%   \n", cpu->usage_percentage);
-    printf("Memory Usage: %.2f %% (Real Used)\n", mem->percent_used);
-    
-    // Alert Section
-    if (cpu->usage_percentage > CPU_ALERT_THRESHOLD) 
-        printf(" [!] CPU ALERT LOGGED   \n");
-    else 
-        printf("                        \n"); 
+void sigint_handler(int signo) {
+    (void)signo;
+    sigint_flag = 1;
+    restore_terminal();
+    _exit(0);
+}
 
-    printf("--------------------------------------------\n");
-    printf("%-8s %-6s %-12s %s\n", "PID", "State", "Mem (MB)", "Name");
-    printf("--------------------------------------------\n");
-    
-    // Display limit
-    int limit = (proc_count < DISPLAY_PROCESSES) ? proc_count : DISPLAY_PROCESSES;
-    
+void enable_raw() {
+    tcgetattr(STDIN_FILENO, &orig_term);
+    atexit(restore_terminal);
+
+    struct termios raw = orig_term;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
+    // non-blocking input
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
+
+    // clear input buffer
+    tcflush(STDIN_FILENO, TCIFLUSH);
+
+    // full-screen alt buffer + hide cursor
+    printf("\033[?1049h\033[H\033[?25l");
+    fflush(stdout);
+
+    // install SIGINT handler
+    struct sigaction sa;
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+}
+
+int sort_cpu(const void *a, const void *b) {
+    const ProcessInfo *p1 = a, *p2 = b;
+    if (p2->cpu_usage > p1->cpu_usage) return 1;
+    if (p2->cpu_usage < p1->cpu_usage) return -1;
+    return 0;
+}
+
+void draw_screen() {
+    GlobalStats *g = get_global_stats();
+    ProcessInfo *plist = get_process_list();
+    int count = get_process_count();
+
+    // Clear full screen each redraw (prevents leftover junk)
+    printf("\033[H\033[2J");
+
+    printf("LINUX RESOURCE MONITOR (Press 'q' to quit)\n");
+    printf("==============================================================\n");
+
+    double cpu = g->cpu_percent;
+    if (cpu < 0) cpu = 0;
+    if (cpu > 100) cpu = 100;
+
+    int bars = cpu / 5.0;
+    printf("CPU: [");
+    for (int i = 0; i < 20; i++) printf(i < bars ? "|" : " ");
+    printf("] %5.1f%%\n", cpu);
+
+    double mem = g->mem_percent;
+    if (mem < 0) mem = 0;
+    if (mem > 100) mem = 100;
+
+    bars = mem / 5.0;
+    printf("MEM: [");
+    for (int i = 0; i < 20; i++) printf(i < bars ? "|" : " ");
+    printf("] %5.1f%% (%lu/%lu MB)\n",
+           mem, g->used_mem_kb/1024, g->total_mem_kb/1024);
+
+    printf("--------------------------------------------------------------\n");
+    printf("%-8s %-20s %-10s %-7s\n", "PID", "NAME", "MEM(MB)", "CPU%");
+
+    qsort(plist, count, sizeof(ProcessInfo), sort_cpu);
+
+    int limit = (count < 20 ? count : 20);
+
     for (int i = 0; i < limit; i++) {
-        double mem_mb = procs[i].rss / 1024.0;
-        // \033[K clears the rest of the line (cleans up old long names)
-        printf("%-8d %-6c %-12.2f %s\033[K\n", procs[i].pid, procs[i].state, mem_mb, procs[i].name);
-    }
-    
-    // Clear everything below our list (in case list shrank)
-    printf("\033[J");
+        // truncate long names to 20 chars
+        char name20[21];
+        strncpy(name20, plist[i].name, 20);
+        name20[20] = '\0';
 
-    printf("--------------------------------------------\n");
-    printf("Total Processes: %d\n", proc_count);
-    printf("Press CTRL+C to quit safely.\n");
+        double cpu_p = plist[i].cpu_usage;
+        if (cpu_p < 0) cpu_p = 0.0;
+        if (cpu_p > 100) cpu_p = 100;
+
+        printf("%-8d %-20s %-10.1f %-7.2f\n",
+               plist[i].pid,
+               name20,
+               plist[i].memory_kb / 1024.0,
+               cpu_p);
+    }
+
     fflush(stdout);
 }
 
 int main() {
-    signal(SIGINT, handle_sigint);
+    enable_raw();
+    update_stats();
 
-    // 1. Enter Alternate Screen Mode (Stops scrolling!)
-    set_alt_screen(1);
+    while (1) {
+        draw_screen();
+        update_stats();
 
-    MemStats m_stats = {0};
-    CpuStats c_stats = {0};
-    static ProcessInfo procs[MAX_TOTAL_PROCESSES];
-    int proc_count = 0;
+        int loops = REFRESH_MS / POLL_MS;
 
-    read_cpu_stats(&c_stats);
-    c_stats.prev = c_stats.curr; 
-
-    while (keep_running) {
-        read_mem_stats(&m_stats);
-        read_cpu_stats(&c_stats);
-        read_processes(procs, MAX_TOTAL_PROCESSES, &proc_count);
-        sort_processes_by_mem(procs, proc_count);
-        calculate_cpu_usage(&c_stats);
-        calculate_mem_usage(&m_stats);
-        check_and_log_alerts(c_stats.usage_percentage, m_stats.percent_used);
-
-        print_stats(&c_stats, &m_stats, procs, proc_count);
-        
-        sleep(1);
+        for (int i = 0; i < loops; i++) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                if (c == 'q' || c == 'Q') {
+                    restore_terminal();
+                    return 0;
+                }
+            }
+            if (sigint_flag) {
+                restore_terminal();
+                return 0;
+            }
+            usleep(POLL_MS * 1000);
+        }
     }
-
-    // 2. Restore Terminal on Exit
-    set_alt_screen(0);
-    printf("Exiting... Logs saved.\n");
-    return 0;
 }
